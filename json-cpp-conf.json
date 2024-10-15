@@ -1,0 +1,20 @@
+{
+    "inputs": [ "Settings.h" ],
+    "settings": {
+        "jsonIOMode": "NULL_TERMINATED_STRING",
+        "noThrow": true,
+        "strictSyntaxCheck": false,
+        "checkMissingKeys": false,
+        "checkRepeatingKeys": false,
+        "ignoreExtraKeys": true,
+        "checkIntegerOverflow": true
+    },
+    "parsers": [ {
+        "name": "SettingsParser",
+        "types": [
+            "Settings"
+        ],
+        "headerOutput": "SettingsParser.h",
+        "sourceOutput": "SettingsParser.cpp"
+    } ]
+}

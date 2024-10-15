@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<!-- Copyright (c) 2024 Viktor Chlumsky -->
+<!-- https://github.com/Chlumsky/msdfgen -->
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MSDFgen SVG</title>
+    <style>
+
+        * { font-family: sans-serif; }
+        body { color: #eee; background: #222; line-height: 1.25; margin: 0; padding: 0; padding-left: 16px; }
+        .error { color: #f30; }
+        h1 { margin: 0; padding: 18px 0; }
+        p { margin: 6px 4px; }
+        fieldset { margin: 8px 2px; }
+        input.slider { height: .75em; }
+        input.numeric { width: 4em; }
+        input.button { text-transform: uppercase; font-weight: bold; margin: 2px; padding: 4px 12px; }
+
+        #leftPanel {
+            margin-right: 16px;
+            padding-bottom: 12px;
+        }
+        #svgDrop {
+            color: #aaa;
+            margin: 8px 4px;
+            border: 2px solid #888;
+            text-transform: uppercase;
+            font-weight: bold;
+            vertical-align: middle;
+        }
+        #svgDrop.nonempty {
+            width: fit-content;
+        }
+        #svgDrop span {
+            display: block;
+            margin: 64px;
+            text-align: center;
+        }
+        .svgImage {
+            max-width: 512px;
+            max-height: 256px;
+        }
+        #previewSettings, #previewWrapper {
+            white-space: nowrap;
+        }
+        #preview {
+            margin-top: 2px;
+            border: 2px solid #888;
+        }
+
+    </style>
+
+    <script>
+
+        var svgData;
+        var previewMetrics;
+
+        var gl;
+        var previewShader;
+        var previewShaderUniform;
+        var quad;
+        var sdfTexture;
+
+        var sdfWidth = 0;
+        var sdfHeight = 0;
+        var previewType = null;
+        var mtsdfPreviewDistanceType = 'both';
+
+        function failUploadGeneratedDistanceField(dummySvg, dummySettings) {
+            return '';
+        }
+
+        function failEncodeGeneratedDistanceField(dummySvg, dummySettings) {
+            return '';
+        }
+
+        function placeholderUploadGeneratedDistanceField(dummySvg, dummySettings) {
+            const pixels = new Uint8Array([0, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255]);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+            sdfWidth = 2;
+            sdfHeight = 2;
+            return '{"scale":1,"pixelRange":1,"zeroDistanceValue":0.5}';
+        }
+        
+        function placeholderEncodeGeneratedDistanceField(dummySvg, dummySettings) {
+            return 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAGUlEQVQI1wXBAQ0AAAzDIJbcv+UeJoUz4AErJAMER49MAgAAAABJRU5ErkJggg==';
+        }
+
+        function noImmediateGlSetup() { }
+
+        function doImmediateGlSetup() {
+            const canvas = document.getElementById("preview");
+            gl = canvas.getContext("webgl");
+            glSetup();
+        }
+
+        var uploadGeneratedDistanceField = placeholderUploadGeneratedDistanceField;
+        var encodeGeneratedDistanceField = placeholderEncodeGeneratedDistanceField;
+        var immediateGlSetup = doImmediateGlSetup;
+
+        /*@FAIL_FUNCTION_PLACEHOLDER@*/
+
+        var Module = {
+            onRuntimeInitialized: function() {
+                const canvas = document.getElementById("preview");
+                var ctxHandle = GL.createContext(canvas, { });
+                GL.makeContextCurrent(ctxHandle);
+                gl = GL.getContext(ctxHandle).GLctx;
+                glSetup();
+
+                uploadGeneratedDistanceField = Module.uploadGeneratedDistanceField;
+                encodeGeneratedDistanceField = Module.encodeGeneratedDistanceField;
+            }
+        };
+
+        function getDimensions() {
+            var width = Number(document.getElementById('width').value);
+            var height;
+            if (document.getElementById('height').value === '')
+                height = width;
+            else
+                height = Number(document.getElementById('height').value);
+            return {
+                'width': width,
+                'height': height
+            };
+        }
+
+        function getSettingsJson() {
+            var dimensions = getDimensions();
+            var obj = {
+                'type': document.getElementById('type').value.toString(),
+                'width': dimensions.width,
+                'height': dimensions.height,
+                'baseRange': Number(document.getElementById('baseRangeValue').value),
+                'outerRange': Number(document.getElementById('outerRangeValue').value),
+                'innerRange': Number(document.getElementById('innerRangeValue').value),
+                'rangeUnits': document.getElementById('rangeUnits').value.toString(),
+                'scaleMode': document.getElementById('scaleMode').value.toString(),
+                'explicitScale': Number(document.getElementById('explicitScale').value),
+                'placementMode': document.getElementById('placementMode').value.toString(),
+                'miterLimit': Number(document.getElementById('miterLimitValue').value),
+                'format': 'png' // document.getElementById('format').value.toString()
+            };
+            return JSON.stringify(obj);
+        }
+
+        function getPreviewMode() {
+            var previewMode = document.getElementById('previewMode').value;
+            var previewDistanceType = document.getElementById('previewDistanceType').value;
+            if (previewType == 'sdf')
+                previewDistanceType = 'euclidean';
+            if (previewType == 'psdf' || previewType == 'msdf')
+                previewDistanceType = 'perpendicular';
+            var mode = 0;
+            if (!(previewType == 'sdf' || previewType == 'psdf')) {
+                if (previewDistanceType == 'euclidean')
+                    mode += 1;
+                if (previewDistanceType == 'perpendicular')
+                    mode += 2;
+                if (previewDistanceType == 'both')
+                    mode += 3;
+            }
+            if (previewMode == 'resolvedSdf')
+                mode += 4;
+            if (previewMode == 'shape')
+                mode += 8;
+            if (previewMode == 'isolines')
+                mode += 12;
+            return mode;
+        }
+
+        function rangeFromSlider(sliderValue) {
+            return sliderValue*sliderValue/4194304.0;
+        }
+
+        function rangeToSlider(range) {
+            return Math.sign(range)*Math.sqrt(4194304.0*Math.abs(range));
+        }
+
+        function updateSliderValue(slider, sliderValueId) {
+            document.getElementById(sliderValueId).value = Math.round(rangeFromSlider(slider.value));
+            updateRangeSummary();
+        }
+
+        function updateSlider(sliderValue, sliderId) {
+            document.getElementById(sliderId).value = rangeToSlider(sliderValue.value);
+            updateRangeSummary();
+        }
+
+        function updateMiterLimitSliderValue() {
+            document.getElementById('miterLimitValue').value = document.getElementById('miterLimitSlider').value;
+        }
+
+        function updateMiterLimitSlider() {
+            document.getElementById('miterLimitSlider').value = document.getElementById('miterLimitValue').value;
+        }
+
+        function updatePositioningEnablement() {
+            var sdfType = document.getElementById('type').value;
+            var rangeUnits = document.getElementById('rangeUnits').value;
+            var scaleMode = document.getElementById('scaleMode').value;
+            var placementMode = document.getElementById('placementMode').value;
+            var useMiterLimit = sdfType != 'sdf' && rangeUnits == 'svgUnits' && (scaleMode == 'fitBoundingBox' || placementMode == 'centerBoundingBox');
+            document.getElementById('explicitScale').disabled = scaleMode != 'explicitScale';
+            document.getElementById('miterLimitSlider').disabled = !useMiterLimit;
+            document.getElementById('miterLimitValue').disabled = !useMiterLimit;
+        }
+
+        function updatePreviewSettings() {
+            document.getElementById('previewMode').disabled = previewType == null;
+            var previewDistanceType = document.getElementById('previewDistanceType');
+            if (!previewDistanceType.disabled)
+                mtsdfPreviewDistanceType = previewDistanceType.value;
+            previewDistanceType.disabled = previewType != 'mtsdf';
+            if (previewType == 'sdf')
+                previewDistanceType.value = 'euclidean';
+            if (previewType == 'psdf' || previewType == 'msdf')
+                previewDistanceType.value = 'perpendicular';
+            if (previewType == 'mtsdf' && mtsdfPreviewDistanceType)
+                previewDistanceType.value = mtsdfPreviewDistanceType;
+        }
+
+        function updateRangeSummary() {
+            var rangeSummary = document.getElementById('rangeSummary');
+            var baseRange = document.getElementById('baseRangeValue').value;
+            var outerRange = document.getElementById('outerRangeValue').value;
+            var innerRange = document.getElementById('innerRangeValue').value;
+            if (isNaN(baseRange) || isNaN(outerRange) || isNaN(innerRange)) {
+                rangeSummary.className = 'error';
+                rangeSummary.innerHTML = 'Invalid range specified.';
+                return;
+            }
+            var rangeLow = -0.5*baseRange-1.0*outerRange;
+            var rangeHigh = 0.5*baseRange+1.0*innerRange;
+            if (rangeLow == rangeHigh) {
+                rangeSummary.className = 'error';
+                rangeSummary.innerHTML = 'Range must have non-zero width.';
+                return;
+            }
+            var rangeUnits = document.getElementById('rangeUnits');
+            var unitSuffix = '???';
+            if (rangeUnits.value == 'pixels')
+                unitSuffix = 'pixels';
+            if (rangeUnits.value == 'svgUnits')
+                unitSuffix = 'SVG units';
+            rangeSummary.className = 'not-error';
+            rangeSummary.innerHTML = 'The color values black (0) to white (1) will represent the distance range from '+rangeLow+' to '+rangeHigh+' '+unitSuffix+'.';
+        }
+
+        function showSvg() {
+            var svgDiv = document.getElementById('svgDrop');
+            svgDiv.innerHTML = '';
+            svgDiv.setAttribute('class', 'nonempty');
+            var svgImg = document.createElement('img');
+            svgImg.setAttribute('src', 'data:image/svg+xml;utf8,'+encodeURIComponent(svgData));
+            svgImg.setAttribute('alt', 'Selected SVG file');
+            svgImg.setAttribute('title', 'Drop SVG file here');
+            svgImg.setAttribute('class', 'svgImage');
+            svgDiv.appendChild(svgImg);
+            document.getElementById('previewButton').disabled = false;
+            document.getElementById('saveButton').disabled = false;
+        }
+
+        function uploadSvg(file) {
+            let reader = new FileReader();
+            reader.onload = function (event) {
+                svgData = event.target.result;
+                showSvg();
+            };
+            reader.readAsText(file);
+        }
+
+        function dropSvg(event) {
+            event.preventDefault();
+            if (event.dataTransfer.files[0].hasOwnProperty(name))
+                document.getElementById('svgFile').value = event.dataTransfer.files[0].name;
+            uploadSvg(event.dataTransfer.files[0]);
+        }
+
+        function makePreview() {
+            var dimensions = getDimensions();
+            sdfWidth = dimensions.width;
+            sdfHeight = dimensions.height;
+            const settingsJson = getSettingsJson();
+            gl.bindTexture(gl.TEXTURE_2D, sdfTexture);
+            var previewMetricsJson = uploadGeneratedDistanceField(svgData, settingsJson);
+            if (previewMetricsJson) {
+                previewType = document.getElementById('type').value.toString();
+                previewMetrics = JSON.parse(previewMetricsJson);
+            } else {
+                sdfWidth = 0;
+                sdfHeight = 0;
+                previewType = null;
+                previewMetrics = { };
+            }
+            updatePreviewSettings();
+            requestAnimationFrame(repaint);
+        }
+
+        function save() {
+            makePreview();
+            var downloadName = 'sdf';
+            var inputFileName = document.getElementById('svgFile').value.replace(/^.*[/\\]/, '').replace(/\.[^/\\.]+$/, '');
+            if (inputFileName)
+                downloadName = inputFileName;
+            //var format = document.getElementById('format').value;
+            var format = 'png';
+            if (format == 'png')
+                downloadName += '.png';
+            if (format == 'tiff')
+                downloadName += '.tiff';
+            const settingsJson = getSettingsJson();
+            var pngBase64 = encodeGeneratedDistanceField(svgData, settingsJson);
+            if (pngBase64) {
+                var virtualLink = document.getElementById('virtualDownloadLink');
+                virtualLink.href = 'data:image/png;base64,'+pngBase64;
+                virtualLink.download = downloadName;
+                virtualLink.click();
+            }
+        }
+
+        function resizePreviewCanvas() {
+            //var cornerStone = document.getElementById('canvasCornerStone');
+            var leftPanel = document.getElementById('leftPanel');
+            var previewSettings = document.getElementById('previewSettings');
+            var previewCanvas = document.getElementById('preview');
+            /*if (window.innerWidth-leftPanel.offsetWidth-56 > 256)
+                previewCanvas.width = (window.innerWidth-leftPanel.offsetWidth-56)*window.devicePixelRatio;
+            else
+                previewCanvas.width = (window.innerWidth-44)*window.devicePixelRatio;*/
+            previewCanvas.width = Math.max(window.innerWidth-leftPanel.offsetWidth-56, 512)*window.devicePixelRatio;
+            previewCanvas.height = Math.max(window.innerHeight-previewSettings.offsetTop-previewSettings.offsetHeight-32, 512)*window.devicePixelRatio;
+            requestAnimationFrame(repaint);
+        }
+
+        function repaint() {
+            gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            if (sdfWidth > 0 && sdfHeight > 0) {
+
+                const canvasWidth = document.getElementById('preview').width;
+                const canvasHeight = document.getElementById('preview').height;
+
+                const hScale = Math.min(1.0*gl.drawingBufferHeight*sdfWidth/(1.0*gl.drawingBufferWidth*sdfHeight), 1.0);
+                const vScale = Math.min(1.0*gl.drawingBufferWidth*sdfHeight/(1.0*gl.drawingBufferHeight*sdfWidth), 1.0);
+                const transformation = [
+                    2.0*hScale, 0.0, 0.0, 0.0,
+                    0.0, 2.0*vScale, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    -hScale, -vScale, 0.0, 1.0
+                ];
+
+                const screenPxRange = previewMetrics.pixelRange*Math.min(1.0*gl.drawingBufferWidth/sdfWidth, 1.0*gl.drawingBufferHeight/sdfHeight);
+                const zeroDistanceValue = previewMetrics.zeroDistanceValue;
+
+                const bgColor = [ 2.0/15.0, 2.0/15.0, 2.0/15.0, 1.0 ];
+                const fgColor = [ 14.0/15.0, 14.0/15.0, 14.0/15.0, 1.0 ];
+
+                gl.bindTexture(gl.TEXTURE_2D, sdfTexture);
+                gl.useProgram(previewShader.program);
+                gl.uniform1i(previewShader.uniform.sdf, 0);
+                gl.uniform1i(previewShader.uniform.mode, getPreviewMode());
+                gl.uniformMatrix4fv(previewShader.uniform.transformation, false, transformation);
+                gl.uniform1f(previewShader.uniform.screenPxRange, screenPxRange);
+                gl.uniform1f(previewShader.uniform.zeroDistanceValue, zeroDistanceValue);
+                gl.uniform4fv(previewShader.uniform.bgColor, bgColor);
+                gl.uniform4fv(previewShader.uniform.fgColor, fgColor);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+                gl.enableVertexAttribArray(0);
+                gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            }
+        }
+
+    </script>
+</head>
+
+<body>
+    <h1>MSDFgen SVG Converter</h1>
+    <div id="leftPanel" style="float: left;">
+        <p>
+            SVG file: <input type="file" id="svgFile" accept=".svg" autocomplete="off" onchange="uploadSvg(event.target.files[0]);">
+        </p>
+        <div id="svgDrop" ondragover="event.preventDefault();" ondrop="dropSvg(event);">
+            <span>Drop SVG file here</span>
+        </div>
+        <table>
+            <tr>
+                <td>Distance field type:</td>
+                <td><select id="type" onchange="updatePositioningEnablement();">
+                    <option value="sdf">SDF - true (Euclidean) signed distance field</option>
+                    <option value="psdf">PSDF - perpendicular signed distance field</option>
+                    <option value="msdf">MSDF - multi-channel signed distance field</option>
+                    <option value="mtsdf" selected="selected">MTSDF - multi-channel with true distance field in alpha channel</option>
+                </select></td>
+            </tr>
+            <tr></tr>
+            <tr>
+                <td>Output dimensions:</td>
+                <td>
+                    <input type="number" id="width" class="dimension" value="256" min="0">
+                    &times;
+                    <input type="number" id="height" class="dimension" min="0" placeholder="Same as width">
+                    pixels
+                </td>
+            </tr>
+        </table>
+        <fieldset>
+            <legend>Representable distance range</legend>
+            <table id="rangeTable">
+                <tr>
+                    <td>Base range:</td>
+                    <td class="stretch"><input type="range" id="baseRangeSlider" class="slider" value="32" min="0" max="256" oninput="updateSliderValue(this, 'baseRangeValue');"></td>
+                    <td><input type="number" id="baseRangeValue" class="numeric rangeValue" value="4" oninput="updateSlider(this, 'baseRangeSlider')"></td>
+                    <td style="width: 32px;"></td>
+                    <td>Range units:</td>
+                </tr>
+                <tr>
+                    <td>+ Outer range:</td>
+                    <td class="stretch"><input type="range" id="outerRangeSlider" class="slider" value="0" min="0" max="256" oninput="updateSliderValue(this, 'outerRangeValue');"></td>
+                    <td><input type="number" id="outerRangeValue" class="numeric rangeValue" value="0" oninput="updateSlider(this, 'outerRangeSlider')"></td>
+                    <td></td>
+                    <td><select id="rangeUnits" onchange="updatePositioningEnablement(); updateRangeSummary();">
+                        <option value="pixels" selected="selected">Output pixels</option>
+                        <option value="svgUnits">SVG units</option>
+                    </select></td>
+                </tr>
+                <tr>
+                    <td>+ Inner range:</td>
+                    <td class="stretch"><input type="range" id="innerRangeSlider" class="slider" value="0" min="0" max="256" oninput="updateSliderValue(this, 'innerRangeValue');"></td>
+                    <td><input type="number" id="innerRangeValue" class="numeric rangeValue" value="0" oninput="updateSlider(this, 'innerRangeSlider')"></td>
+                    <td></td>
+                    <td></td>
+                </tr>
+            </table>
+            <p id="rangeSummary" style="width: 30em; height: 2.5em;">
+                The color values black (0) to white (1) will represent this distance range.
+            </p>
+        </fieldset>
+        <fieldset>
+            <legend>Positioning</legend>
+            <table id="positioningTable">
+                <tr>
+                    <td>Scaling:</td>
+                    <td><select id="scaleMode" onchange="updatePositioningEnablement();">
+                        <option value="explicitScale" title="Set a specific scale (multiplier from SVG units to pixels) to the right of this field.">Explicit scale:</option>
+                        <option value="fitCanvas" title="Selects scale such that the entire width and height of the SVG canvas fits in the output image. If the aspect ratio is equal, the output will cover exactly the area of the SVG canvas.">Fit SVG canvas</option>
+                        <option value="fitPaddedCanvas" title="Selects scale to fit the entire SVG canvas expanded in each direction by the outer portion of the distance range.">Fit SVG canvas + outer range</option>
+                        <option value="fitBoundingBox" selected="selected" title="Selects scale such that the entire SVG shape and its outer distance range fits. Miter limit may affect the bounding box for non-Euclidean distance fields.">Fit bounding box</option>
+                    </select></td>
+                    <td><input type="number" id="explicitScale" class="numeric" value="1" title="Explicit scale value (requires Explicit scale option)"></td>
+                </tr>
+                <tr>
+                    <td>Placement:</td>
+                    <td><select id="placementMode" onchange="updatePositioningEnablement();">
+                        <option value="noTranslate" title="No translation will be applied and the top left corner of the SVG canvas will correspond to the top left corner of the output.">Do not translate</option>
+                        <option value="paddedTranslate" title="The top left corner will be translated to account for the outer distance range in the output.">Translate by outer range</option>
+                        <option value="centerCanvas" title="Ensures that the center of the SVG canvas corresponds to the center of the output image.">Center SVG canvas</option>
+                        <option value="centerBoundingBox" selected="selected" title="Ensures that the center of the SVG shape's bounding box (including outer distance range) will correspond to the center of the output image. Miter limit may affect the bounding box for non-Euclidean distance fields.">Center bounding box</option>
+                    </select></td>
+                    <td></td>
+                </tr>
+                <tr>
+                    <td>Miter limit:</td>
+                    <td class="stretch"><input type="range" id="miterLimitSlider" class="slider" value="1" min="0" max="8" step="0.001" oninput="updateMiterLimitSliderValue();"></td>
+                    <td><input type="number" id="miterLimitValue" class="numeric" value="1" min="0" step="0.001" oninput="updateMiterLimitSlider();"></td>
+                </tr>
+            </table>
+        </fieldset>
+        <!--<p>
+            Output format:
+            <select id="format">
+                <option value="png" selected="selected">PNG (8 bits / channel)</option>
+                <option value="tiff">TIFF (floating-point channels)</option>
+            </select>
+        </p>-->
+        <p style="text-align: right;">
+            <a href="#" id="virtualDownloadLink" style="display: hidden;"></a>
+            <input type="button" id="previewButton" class="button" value="Preview" onclick="makePreview();">
+            <input type="button" id="saveButton" class="button" value="Save" onclick="save();">
+        </p>
+    </div>
+    <div id="previewSettings">
+        <p>
+            Preview:
+            <select id="previewMode" onchange="requestAnimationFrame(repaint);">
+                <option value="rawSdf">Raw distance field</option>
+                <option value="resolvedSdf">Resolved distance field</option>
+                <option value="isolines">Isolines</option>
+                <option value="shape" selected="selected">Rendered shape</option>
+            </select>
+            <select id="previewDistanceType" onchange="requestAnimationFrame(repaint);">
+                <option value="perpendicular">Perpendicular distance</option>
+                <option value="euclidean">Euclidean distance</option>
+                <option value="both" selected="selected">Both (by color)</option>
+            </select>
+        </p>
+    </div>
+    <div id="canvasCornerStone"></div>
+    <div id="previewWrapper">
+        <canvas id="preview" width="640" height="480"></canvas>
+    </div>
+
+    <script>
+
+        rangeValues = document.createElement('datalist');
+        rangeValues.id = 'range-slider-values';
+        for (var i = 0; i <= 256;) {
+            var option = document.createElement('option');
+            option.value = Math.round(rangeToSlider(i));
+            rangeValues.appendChild(option);
+            i += Math.max(1, 1<<Math.floor(Math.log2(i>>2)));
+        }
+        document.head.appendChild(rangeValues);
+
+        function initRangeSlider(id, valueId) {
+            var slider = document.getElementById(id);
+            slider.setAttribute('list', rangeValues.id);
+            slider.setAttribute('max', Math.round(rangeToSlider(256)));
+            updateSlider(document.getElementById(valueId), id);
+        }
+        initRangeSlider('baseRangeSlider', 'baseRangeValue');
+        initRangeSlider('outerRangeSlider', 'outerRangeValue');
+        initRangeSlider('innerRangeSlider', 'innerRangeValue');
+
+        document.getElementById('previewButton').disabled = true;
+        document.getElementById('saveButton').disabled = true;
+        document.getElementById('previewMode').disabled = true;
+        document.getElementById('previewDistanceType').disabled = true;
+        updatePositioningEnablement();
+
+        function glSetup() {
+            gl.disable(gl.DEPTH_TEST);
+            gl.disable(gl.BLEND);
+            gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+            gl.clearColor(0.0, 0.0, 0.0, 0.0);
+
+            const vertexSrc = `
+                #version 100
+                precision mediump float;
+                attribute vec2 coord;
+                varying vec2 texCoord;
+                uniform mat4 transformation;
+
+                void main() {
+                    texCoord = coord;
+                    gl_Position = transformation*vec4(coord, 0.0, 1.0);
+                }
+            `;
+            const fragmentSrc = `
+                #version 100
+                precision mediump float;
+                varying vec2 texCoord;
+                uniform sampler2D sdf;
+                uniform int mode;
+                uniform float screenPxRange;
+                uniform float zeroDistanceValue;
+                uniform vec4 bgColor;
+                uniform vec4 fgColor;
+
+                float median(vec3 msd) {
+                    return max(min(msd.r, msd.g), min(max(msd.r, msd.g), msd.b));
+                }
+
+                void main() {
+                    gl_FragColor.a = 1.0;
+                    int drawMode = mode/4;
+                    int distanceMode = mode-4*drawMode;
+                    vec4 rawMsd = texture2D(sdf, texCoord);
+                    if (drawMode == 0) {
+                        if (distanceMode == 1)
+                            rawMsd.rgb = vec3(1.0);
+                        if (distanceMode == 2)
+                            rawMsd.a = 1.0;
+                        gl_FragColor.rgb = rawMsd.rgb*rawMsd.a;
+                        return;
+                    }
+
+                    vec2 sd = vec2(rawMsd.r);
+                    if (distanceMode >= 2)
+                        sd = vec2(median(rawMsd.rgb));
+                    if (distanceMode == 1)
+                        sd = vec2(rawMsd.a);
+                    if (distanceMode == 3)
+                        sd.g = rawMsd.a;
+
+                    if (drawMode == 1) {
+                        gl_FragColor.rgb = vec3(0.0, 0.5, 1.0)*sd.r + vec3(1.0, 0.5, 0.0)*sd.g;
+                        return;
+                    }
+
+                    vec2 pxsd = screenPxRange*(sd - zeroDistanceValue);
+                    vec2 opacity = clamp(pxsd + 0.5, vec2(0.0), vec2(1.0));
+                    if (drawMode == 2) {
+                        gl_FragColor = vec4(0.0, 0.5, 1.0, 0.5)*mix(bgColor, fgColor, opacity.r) + vec4(1.0, 0.5, 0.0, 0.5)*mix(bgColor, fgColor, opacity.g);
+                        return;
+                    }
+                    if (drawMode == 3) {
+                        const float isolineWidth = 16.0;
+                        vec2 fractSd = isolineWidth*(1.0-fract(1.0/isolineWidth*pxsd));
+                        vec2 isolines = 1.0/(isolineWidth-1.0)*(fractSd-0.5+isolineWidth*(max(0.5-fractSd, 0.0)-max(fractSd-(isolineWidth-0.5), 0.0)));
+                        vec2 fill = min((1.0-step(vec2(0.0), -sd))*(0.5*opacity + 0.5*isolines)+step(vec2(1.0), sd), 1.0);
+                        gl_FragColor.rgb = vec3(0.0, 0.5, 1.0)*fill.r + vec3(1.0, 0.5, 0.0)*fill.g;
+                        return;
+                    }
+                }
+            `;
+
+            var vs = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vs, vertexSrc);
+            gl.compileShader(vs);
+            var fs = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fs, fragmentSrc);
+            gl.compileShader(fs);
+            var program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.bindAttribLocation(program, 0, "coord");
+            gl.linkProgram(program);
+            previewShader = {
+                'program': program,
+                'uniform' : {
+                    'sdf': gl.getUniformLocation(program, "sdf"),
+                    'mode': gl.getUniformLocation(program, "mode"),
+                    'transformation': gl.getUniformLocation(program, "transformation"),
+                    'screenPxRange': gl.getUniformLocation(program, "screenPxRange"),
+                    'zeroDistanceValue': gl.getUniformLocation(program, "zeroDistanceValue"),
+                    'bgColor': gl.getUniformLocation(program, "bgColor"),
+                    'fgColor': gl.getUniformLocation(program, "fgColor")
+                }
+            };
+            gl.detachShader(program, vs);
+            gl.detachShader(program, fs);
+            gl.deleteShader(vs);
+            gl.deleteShader(fs);
+            quad = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([ 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0 ]), gl.STATIC_DRAW);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            sdfTexture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, sdfTexture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+            resizePreviewCanvas();
+            window.addEventListener('resize', resizePreviewCanvas, false);
+            requestAnimationFrame(repaint);
+        }
+
+        immediateGlSetup();
+
+        /*@MODULE_PLACEHOLDER@*/
+
+    </script>
+
+</body>
+
+</html>
